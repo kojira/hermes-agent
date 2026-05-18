@@ -157,6 +157,24 @@ class TestCmdUpdateBranchFallback:
             (["/usr/bin/npm", "run", "build"], PROJECT_ROOT / "apps" / "dashboard"),
         ]
 
+        # Regression for #18840: repo root + ui-tui installs must stream
+        # output (capture_output=False) so postinstall progress is visible
+        # to the user.
+        repo_and_tui_calls = [
+            call
+            for call in mock_run.call_args_list
+            if call.args
+            and call.args[0][0] == "/usr/bin/npm"
+            and call.args[0][1] == "ci"
+            and call.kwargs.get("cwd") in {PROJECT_ROOT, PROJECT_ROOT / "ui-tui"}
+        ]
+        assert len(repo_and_tui_calls) == 2
+        for call in repo_and_tui_calls:
+            assert call.kwargs.get("capture_output") is False, (
+                "repo-root / ui-tui npm install must stream output "
+                "(no capture_output) so postinstall progress is visible"
+            )
+
     def test_update_non_interactive_runs_safe_config_migrations(self, mock_args, capsys):
         """Dashboard/web updates apply non-interactive migrations before restart."""
         with patch("shutil.which", return_value=None), patch(

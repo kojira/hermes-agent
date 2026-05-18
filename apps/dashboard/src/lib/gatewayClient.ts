@@ -5,6 +5,8 @@ import {
   type GatewayEventName,
 } from "@hermes/shared";
 
+import { HERMES_BASE_PATH } from "@/lib/api";
+
 export type { ConnectionState, GatewayEvent, GatewayEventName };
 
 /**
@@ -24,7 +26,7 @@ export class GatewayClient extends JsonRpcGatewayClient {
 
     const scheme = location.protocol === "https:" ? "wss:" : "ws:";
     await super.connect(
-      `${scheme}//${location.host}/api/ws?token=${encodeURIComponent(resolved)}`,
+      `${scheme}//${location.host}${HERMES_BASE_PATH}/api/ws?token=${encodeURIComponent(resolved)}`,
     );
   }
 }

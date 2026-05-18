@@ -1396,7 +1396,7 @@ def _detect_light_mode() -> bool:
             last = cfgbg.split(";")[-1] if ";" in cfgbg else cfgbg
             if last.isdigit():
                 bg = int(last)
-                if bg in (7, 15):
+                if bg in {7, 15}:
                     result = True
                     _LIGHT_MODE_CACHE = result
                     return result
@@ -2412,6 +2412,7 @@ def _looks_like_slash_command(text: str) -> bool:
 
 from agent.skill_commands import (
     scan_skill_commands,
+    get_skill_commands,
     build_skill_invocation_message,
     build_preloaded_skills_prompt,
 )
@@ -2824,6 +2825,11 @@ class HermesCLI:
         # turn (which would make Ctrl+C feel like it did nothing).
         self._last_turn_interrupted = False
         self._should_exit = False
+        # /exit --delete: when True, the current session's SQLite history and
+        # on-disk transcripts are deleted during shutdown. Set by
+        # process_command() when the user runs /exit --delete or /quit --delete.
+        # Ported from google-gemini/gemini-cli#19332.
+        self._delete_session_on_exit = False
         self._last_ctrl_c_time = 0
         self._clarify_state = None
         self._clarify_freetext = False
@@ -7653,6 +7659,16 @@ class HermesCLI:
         canonical = _cmd_def.name if _cmd_def else _base_word
         
         if canonical in {"quit", "exit"}:
+            # Parse --delete flag: /exit --delete also removes the current
+            # session's transcripts + SQLite history. Ported from
+            # google-gemini/gemini-cli#19332.
+            _rest = cmd_original.split(None, 1)
+            _args = (_rest[1] if len(_rest) > 1 else "").strip().lower()
+            if _args in {"--delete", "-d"}:
+                self._delete_session_on_exit = True
+            elif _args:
+                _cprint(f"  {_DIM}✗ Unknown argument: {_escape(_args)}. Use /exit --delete to also remove session history.{_RST}")
+                return True
             return False
         elif canonical == "help":
             self.show_help()
@@ -9598,12 +9614,18 @@ class HermesCLI:
         prompt caching intact.
         """
         try:
-            from agent.skill_commands import reload_skills
+            from agent.skill_commands import reload_skills, get_skill_commands
 
             if not self._command_running:
                 print("🔄 Reloading skills...")
 
             result = reload_skills()
+
+            # Sync cli.py's module-level _skill_commands so all consumers
+            # (help display, command dispatch, Tab-completion lambda) see the
+            # updated dict without needing to restart the session.
+            global _skill_commands
+            _skill_commands = get_skill_commands()
             added = result.get("added", [])      # [{"name", "description"}, ...]
             removed = result.get("removed", [])  # [{"name", "description"}, ...]
             total = result.get("total", 0)
@@ -12609,7 +12631,7 @@ class HermesCLI:
 
 
         _completer = SlashCommandCompleter(
-            skill_commands_provider=lambda: _skill_commands,
+            skill_commands_provider=lambda: get_skill_commands(),
             command_filter=cli_ref._command_available,
         )
         input_area = TextArea(
@@ -13777,7 +13799,7 @@ class HermesCLI:
             if _errno == errno.EIO:
                 pass  # suppress broken-stdout I/O errors on interrupt (#13710)
             elif (
-                _errno in (errno.EINVAL, errno.EBADF)
+                _errno in {errno.EINVAL, errno.EBADF}
                 or "is not registered" in _msg
                 or "Bad file descriptor" in _msg
                 or "Invalid argument" in _msg
@@ -13824,6 +13846,19 @@ class HermesCLI:
                     self._session_db.end_session(self.agent.session_id, "cli_close")
                 except (Exception, KeyboardInterrupt) as e:
                     logger.debug("Could not close session in DB: %s", e)
+                # /exit --delete: also remove the current session's transcripts
+                # and SQLite history. Ported from google-gemini/gemini-cli#19332.
+                if getattr(self, '_delete_session_on_exit', False):
+                    try:
+                        from hermes_constants import get_hermes_home as _ghh
+                        _sessions_dir = _ghh() / "sessions"
+                        _sid = self.agent.session_id
+                        if self._session_db.delete_session(_sid, sessions_dir=_sessions_dir):
+                            _cprint(f"  {_DIM}✓ Session {_escape(_sid)} deleted{_RST}")
+                        else:
+                            _cprint(f"  {_DIM}✗ Session {_escape(_sid)} not found for deletion{_RST}")
+                    except (Exception, KeyboardInterrupt) as e:
+                        logger.debug("Could not delete session on exit: %s", e)
             # Plugin hook: on_session_end — safety net for interrupted exits.
             # run_conversation() already fires this per-turn on normal completion,
             # so only fire here if the agent was mid-turn (_agent_running) when
