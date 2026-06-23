@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
-import { ChevronRight, X } from '@/lib/icons'
+import { ChevronRight } from '@/lib/icons'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { cn } from '@/lib/utils'
 import { PREVIEW_PANE_ID } from '@/store/layout'
@@ -76,7 +76,7 @@ export const PreviewStatusRow = memo(function PreviewStatusRow({ item, onDismiss
 
   return (
     <StatusRow
-      leading={<ChevronRight aria-hidden className="size-3 text-muted-foreground/80" />}
+      leading={<ChevronRight aria-hidden className="size-[0.8rem] text-muted-foreground/80" />}
       onActivate={() => void togglePreview()}
       trailing={
         <span className="-my-1 flex items-center gap-0.5">
@@ -107,7 +107,7 @@ export const PreviewStatusRow = memo(function PreviewStatusRow({ item, onDismiss
               type="button"
               variant="ghost"
             >
-              <X size={12} />
+              <Codicon name="close" size="0.75rem" />
             </Button>
           </Tip>
         </span>

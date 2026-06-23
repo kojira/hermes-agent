@@ -30,6 +30,14 @@ import { StatusItemRow } from './status-row'
 // emit no event when they die). Only armed while a running row is on screen.
 const BACKGROUND_POLL_MS = 5_000
 
+// Real codicons per group (no sparkles): a checklist for todos, a bot for
+// subagents, a background process glyph for background tasks.
+const GROUP_ICON: Record<StatusGroup['type'], string> = {
+  todo: 'checklist',
+  subagent: 'hubot',
+  background: 'server-process'
+}
+
 const groupLabel = (group: StatusGroup, s: Translations['statusStack']) => {
   if (group.type === 'todo') {
     return s.todos(group.items.filter(i => i.todoStatus === 'completed').length, group.items.length)
@@ -107,11 +115,7 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
           ) : undefined
         }
         defaultCollapsed={group.type !== 'todo'}
-        icon={
-          group.type === 'todo' ? (
-            <Codicon className="text-muted-foreground/70" name="checklist" size="0.8rem" />
-          ) : undefined
-        }
+        icon={<Codicon className="text-muted-foreground/70" name={GROUP_ICON[group.type]} size="0.8rem" />}
         label={groupLabel(group, t.statusStack)}
       >
         {group.items.map(item => (
@@ -190,12 +194,10 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
 
   return (
     <div
-      // Sits above the composer (bottom-full), nudged down by the shell's 0.5rem
-      // top pad (pt-2 on composer-root) plus 1px so its bottom edge overlaps the
-      // composer surface's top border. z BELOW the surface (z-4) so the surface's
-      // top border paints over our transparent bottom border — one seam, no
-      // double line.
-      className="absolute inset-x-0 bottom-full z-3 max-h-[40vh] translate-y-[calc(0.5rem+1px)] overflow-y-auto"
+      // Sits in the overlay lane above the composer. The composer root has pt-2
+      // before the actual surface; translate by that amount so the stack returns
+      // to its original attachment point without intruding into the repo strip.
+      className="absolute inset-x-0 bottom-full z-3 max-h-[40vh] translate-y-2 overflow-y-auto"
       onPointerDownCapture={() => blurComposerInput()}
       ref={stackRef}
     >
@@ -205,17 +207,19 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
           Rounded top, square bottom; the bottom border is TRANSPARENT — the
           composer surface's visible top border (which sits at a higher z) is the
           single shared seam, so the two read as one fused capsule. */}
-      <div className={cn(composerDockCard('top'), 'mx-2 rounded-b-none border-b border-b-transparent pt-0.5 pb-1')}>
-        <div
-          className={cn(
-            'transition-opacity duration-200 ease-out',
-            scrolledUp ? 'opacity-30 group-hover/composer:opacity-100' : 'opacity-100'
-          )}
-        >
-          {sections.map(section => (
-            <div key={section.key}>{section.node}</div>
-          ))}
-        </div>
+      <div
+        className={cn(
+          composerDockCard('top'),
+          // Inset (mx-2) so the stack reads slightly narrower than the composer
+          // surface below it — the original look.
+          'mx-2 overflow-hidden rounded-b-none border-b border-b-transparent pt-0.5',
+          'transition-opacity duration-200 ease-out',
+          scrolledUp ? 'opacity-30 group-hover/composer:opacity-100' : 'opacity-100'
+        )}
+      >
+        {sections.map(section => (
+          <div key={section.key}>{section.node}</div>
+        ))}
       </div>
     </div>
   )

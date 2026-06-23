@@ -45,8 +45,8 @@ import {
   $composerPoppedOut,
   POPOUT_WIDTH_REM,
   readPopoutBounds,
-  setComposerPoppedOut,
-  setComposerPopoutPosition
+  setComposerPopoutPosition,
+  setComposerPoppedOut
 } from '@/store/composer-popout'
 import {
   $queuedPromptsBySession,
@@ -60,8 +60,10 @@ import {
   updateQueuedPrompt
 } from '@/store/composer-queue'
 import { $statusItemsBySession } from '@/store/composer-status'
-import { $previewStatusBySession } from '@/store/preview-status'
 import { notify } from '@/store/notifications'
+import { $previewStatusBySession } from '@/store/preview-status'
+import { requestStartWorkSession, startWorkInRepo, switchBranchInRepo } from '@/store/projects'
+import { toggleReview } from '@/store/review'
 import { $gatewayState, $messages, setSessionPickerOpen } from '@/store/session'
 import { $threadScrolledUp } from '@/store/thread-scroll'
 import { isSecondaryWindow } from '@/store/windows'
@@ -79,7 +81,8 @@ import {
   markActiveComposer,
   onComposerFocusRequest,
   onComposerInsertRefsRequest,
-  onComposerInsertRequest
+  onComposerInsertRequest,
+  onComposerSubmitRequest
 } from './focus'
 import { HelpHint } from './help-hint'
 import { useAtCompletions } from './hooks/use-at-completions'
@@ -107,6 +110,7 @@ import {
   slashChipElement
 } from './rich-editor'
 import { ComposerStatusStack } from './status-stack'
+import { CodingStatusRow } from './status-stack/coding-row'
 import { detectTrigger, extractClipboardImageBlobs, textBeforeCaret, type TriggerState } from './text-utils'
 import { ComposerTriggerPopover } from './trigger-popover'
 import type { ChatBarProps } from './types'
@@ -1324,6 +1328,45 @@ export function ChatBar({
     }
   }, [aui])
 
+  // Hand a worktree off to the controller: open a fresh session anchored there,
+  // carrying the composer draft as its first turn. Clearing here means the draft
+  // travels to the new session instead of getting stashed under this one.
+  const openInWorktree = useCallback(
+    (path: string) => {
+      const text = draftRef.current
+      clearDraft()
+      clearComposerAttachments()
+      requestStartWorkSession(path, text)
+    },
+    [clearDraft]
+  )
+
+  // Branch off into a NEW worktree (base = branch name, or current HEAD). A
+  // create failure throws back to the row (which toasts) before we touch the
+  // draft; a missing cwd / remote backend no-ops (the row hides the affordance).
+  const handleBranchOff = useCallback(
+    async (branch: string, base?: string) => {
+      const repoPath = cwd?.trim()
+      const result = repoPath && (await startWorkInRepo(repoPath, { base, branch, name: branch }))
+
+      if (result) {
+        openInWorktree(result.path)
+      }
+    },
+    [cwd, openInWorktree]
+  )
+
+  const handleSwitchBranch = useCallback(
+    async (branch: string) => {
+      const repoPath = cwd?.trim()
+
+      if (repoPath) {
+        await switchBranchInRepo(repoPath, branch)
+      }
+    },
+    [cwd]
+  )
+
   const loadIntoComposer = (text: string, attachments: ComposerAttachment[]) => {
     draftRef.current = text
     aui.composer().setText(text)
@@ -1678,6 +1721,22 @@ export function ChatBar({
       .then(accepted => void (accepted === false ? restore() : clearSessionDraft(submittedScope)))
       .catch(restore)
   }
+
+  // External "submit this prompt" requests (e.g. the review pane's agent-ship
+  // button) route through the same send path. A ref keeps the listener stable
+  // while always calling the latest dispatchSubmit closure.
+  const dispatchSubmitRef = useRef(dispatchSubmit)
+  dispatchSubmitRef.current = dispatchSubmit
+
+  useEffect(
+    () =>
+      onComposerSubmitRequest(({ target, text }) => {
+        if (target === 'main' && !inputDisabled) {
+          dispatchSubmitRef.current(text)
+        }
+      }),
+    [inputDisabled]
+  )
 
   const submitDraft = () => {
     if (disabled) {
@@ -2054,7 +2113,7 @@ export function ChatBar({
           <div className="relative w-full rounded-[inherit]">
             <div
               className={cn(
-                'group/composer-surface relative z-4 isolate rounded-[inherit] border border-[color-mix(in_srgb,var(--dt-composer-ring)_calc(18%*var(--composer-ring-strength)),var(--dt-input))] transition-[border-color] duration-200 ease-out focus-within:border-[color-mix(in_srgb,var(--dt-composer-ring)_calc(45%*var(--composer-ring-strength)),transparent)]',
+                'group/composer-surface relative z-4 isolate grid grid-rows-[auto_1fr] overflow-hidden rounded-[inherit] border border-[color-mix(in_srgb,var(--dt-composer-ring)_calc(18%*var(--composer-ring-strength)),var(--dt-input))]',
                 COMPOSER_DROP_FADE_CLASS,
                 dragActive && COMPOSER_DROP_ACTIVE_CLASS
               )}
@@ -2068,6 +2127,12 @@ export function ChatBar({
                   composerFill,
                   composerSurfaceGlass
                 )}
+              />
+              <CodingStatusRow
+                onBranchOff={handleBranchOff}
+                onOpen={toggleReview}
+                onOpenWorktree={openInWorktree}
+                onSwitchBranch={handleSwitchBranch}
               />
               <div
                 className={cn(
