@@ -5441,6 +5441,15 @@ def _(rid, params: dict) -> dict:
             usage["credits_lines"] = credits
     except Exception:
         pass
+    # Shared dollar usage model (two-bar view) — the dollars-only replacement for
+    # the legacy credits text block. Same fail-open posture. The client renders
+    # these bars and a clean balance summary in place of credits_lines.
+    try:
+        from agent.billing_usage import build_usage_model
+
+        usage["usage"] = _serialize_usage_model(build_usage_model())
+    except Exception:
+        pass
     return _ok(rid, usage)
 
 
@@ -5591,6 +5600,73 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"ok": True, "logged_in": False, "error": "could not load billing state"})
 
 
+def _serialize_usage_bar(bar) -> Optional[dict]:
+    """Serialize a UsageBar (dollar magnitudes → display strings + fractions)."""
+    if bar is None:
+        return None
+    from agent.billing_usage import _fmt_usd
+
+    return {
+        "kind": bar.kind,
+        "remaining_usd": bar.remaining_usd,
+        "remaining_display": _fmt_usd(bar.remaining_usd),
+        "total_usd": bar.total_usd,
+        "total_display": _fmt_usd(bar.total_usd),
+        "spent_usd": bar.spent_usd,
+        "spent_display": _fmt_usd(bar.spent_usd),
+        "pct_used": bar.pct_used,
+        "fill_fraction": bar.fill_fraction,
+    }
+
+
+def _serialize_usage_model(model) -> dict:
+    """Serialize a UsageModel for the wire — the shared two-bar dollar view.
+
+    Dollars-only (no 'credits'); fail-open shape mirrors the other billing RPCs
+    ({ok, available:false} when logged out / unreachable).
+    """
+    from agent.billing_usage import _fmt_usd, format_renews
+
+    if model is None or not getattr(model, "available", False):
+        return {"ok": True, "available": False}
+
+    return {
+        "ok": True,
+        "available": True,
+        "status": model.status,
+        "plan_name": model.plan_name,
+        "renews_at": model.renews_at,
+        "renews_display": getattr(model, "renews_display", None) or format_renews(model.renews_at),
+        "subscription_remaining_display": (
+            None if model.subscription_remaining_usd is None else _fmt_usd(model.subscription_remaining_usd)
+        ),
+        "topup_remaining_display": (
+            None if model.topup_remaining_usd is None else _fmt_usd(model.topup_remaining_usd)
+        ),
+        "total_spendable_display": (
+            None if model.total_spendable_usd is None else _fmt_usd(model.total_spendable_usd)
+        ),
+        "has_topup": model.has_topup,
+        "plan_bar": _serialize_usage_bar(model.plan_bar),
+        "topup_bar": _serialize_usage_bar(model.topup_bar),
+    }
+
+
+@method("usage.bars")
+def _(rid, params: dict) -> dict:
+    """Shared dollar usage model (two-bar view) for /usage + /subscription.
+
+    Fail-open: logged-out / unreachable portal → {ok:true, available:false}.
+    No scope required (read-only).
+    """
+    try:
+        from agent.billing_usage import build_usage_model
+
+        return _ok(rid, _serialize_usage_model(build_usage_model()))
+    except Exception:
+        return _ok(rid, {"ok": True, "available": False})
+
+
 def _serialize_subscription_state(state) -> dict:
     """Serialize a SubscriptionState for the wire (Decimals → strings)."""
     from agent.billing_view import format_money
@@ -5636,7 +5712,29 @@ def _serialize_subscription_state(state) -> dict:
         "tiers": tiers,
         "portal_url": state.portal_url,
         "error": state.error,
+        # Shared dollar usage model (two-bar view) embedded so /subscription
+        # renders the same bars as /usage from its single fetch. Built from the
+        # separate account-info path (the only source with top-up dollars);
+        # fail-open → {available:false}. Computed lazily so a logged-out state
+        # adds no cost.
+        "usage": _subscription_usage_payload(state),
     }
+
+
+def _subscription_usage_payload(state) -> dict:
+    """Best-effort shared usage model for the /subscription overlay's bars.
+
+    Only fetched when logged in; fail-open to {available:false} so the overview
+    still renders if the account-info path is down.
+    """
+    if not getattr(state, "logged_in", False):
+        return {"available": False}
+    try:
+        from agent.billing_usage import build_usage_model
+
+        return _serialize_usage_model(build_usage_model())
+    except Exception:
+        return {"available": False}
 
 
 @method("subscription.state")
