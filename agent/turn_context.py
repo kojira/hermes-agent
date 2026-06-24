@@ -57,6 +57,22 @@ def _compression_made_progress(
     return orig_tokens > 0 and new_tokens < orig_tokens * 0.95
 
 
+def _reset_after_preflight_compression(agent: Any) -> None:
+    """Clear per-turn retry/mute state after preflight compression.
+
+    ``agent._compress_context()`` can materially rewrite the active prompt and
+    rotate the backing session. Any retry bookkeeping collected against the
+    pre-compression prompt must not leak into the first request made with the
+    compressed context; otherwise an already-spent empty/prefill budget or
+    post-response mute flag can make the resumed turn fail immediately.
+    """
+    agent._empty_content_retries = 0
+    agent._thinking_prefill_retries = 0
+    agent._last_content_with_tools = None
+    agent._last_content_tools_all_housekeeping = False
+    agent._mute_post_response = False
+
+
 @dataclass
 class TurnContext:
     """Values produced by the turn prologue and consumed by the turn loop."""
@@ -355,13 +371,35 @@ def build_turn_context(
                 ):
                     break  # Cannot compress further: neither rows nor tokens moved
                 conversation_history = None
-                agent._empty_content_retries = 0
-                agent._thinking_prefill_retries = 0
-                agent._last_content_with_tools = None
-                agent._last_content_tools_all_housekeeping = False
-                agent._mute_post_response = False
+                _reset_after_preflight_compression(agent)
                 if not _compressor.should_compress(_preflight_tokens):
                     break
+        else:
+            _preflight_hook = getattr(_compressor, "should_compress_preflight", None)
+            _wants_preflight = False
+            if callable(_preflight_hook):
+                try:
+                    _wants_preflight = bool(_preflight_hook(messages))
+                except Exception as _preflight_exc:
+                    logger.debug(
+                        "should_compress_preflight raised %s; skipping",
+                        _preflight_exc,
+                    )
+            if _wants_preflight:
+                logger.info(
+                    "Engine-driven preflight maintenance: %s engine requested compress() at ~%s tokens",
+                    getattr(_compressor, "name", "context_engine"),
+                    f"{_preflight_tokens:,}",
+                )
+                messages, active_system_prompt = agent._compress_context(
+                    messages, system_message, approx_tokens=_preflight_tokens,
+                    task_id=effective_task_id,
+                )
+                # Compression may have created a new session — clear the
+                # history reference so _flush_messages_to_session_db writes
+                # the full compressed transcript to the new session's DB.
+                conversation_history = None
+                _reset_after_preflight_compression(agent)
 
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""

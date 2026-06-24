@@ -4148,6 +4148,132 @@ class TestRunConversation:
         assert result["final_response"] == "All done"
         assert result["completed"] is True
 
+    def test_engine_preflight_fires_below_threshold_and_resets_state(self, agent):
+        """Sub-threshold should_compress_preflight() routes to compression.
+
+        Regression test for #20316: engines like hermes-lcm can request
+        incremental maintenance before the normal token threshold. The
+        engine-driven path must also mirror the regular preflight cleanup so
+        stale retry/mute state from the pre-compression prompt cannot leak into
+        the first compressed request.
+        """
+        self._setup_agent(agent)
+        agent.compression_enabled = True
+
+        protect_first = agent.context_compressor.protect_first_n
+        protect_last = agent.context_compressor.protect_last_n
+        prefill = []
+        for _i in range(protect_first + protect_last + 4):
+            prefill.append({"role": "user", "content": f"q{_i}"})
+            prefill.append({"role": "assistant", "content": f"a{_i}"})
+
+        # Keep the normal threshold path inactive so only the engine hook can
+        # trigger compression.
+        agent.context_compressor.threshold_tokens = 10**9
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Done", finish_reason="stop"
+        )
+
+        def _dirty_then_compress(*_args, **_kwargs):
+            agent._empty_content_retries = 2
+            agent._thinking_prefill_retries = 2
+            agent._last_content_with_tools = {"role": "assistant", "content": "stale"}
+            agent._last_content_tools_all_housekeeping = True
+            agent._mute_post_response = True
+            return ([{"role": "user", "content": "hello"}], "compressed system prompt")
+
+        with (
+            patch.object(
+                agent.context_compressor,
+                "should_compress_preflight",
+                return_value=True,
+            ) as mock_preflight,
+            patch.object(agent, "_compress_context", side_effect=_dirty_then_compress) as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", conversation_history=prefill)
+
+        mock_preflight.assert_called_once()
+        mock_compress.assert_called_once()
+        assert agent._empty_content_retries == 0
+        assert agent._thinking_prefill_retries == 0
+        assert agent._last_content_with_tools is None
+        assert agent._last_content_tools_all_housekeeping is False
+        assert agent._mute_post_response is False
+        assert result["final_response"] == "Done"
+        assert result["completed"] is True
+
+    def test_engine_preflight_skipped_when_returns_false(self, agent):
+        """A False engine preflight result must not call compress()."""
+        self._setup_agent(agent)
+        agent.compression_enabled = True
+
+        protect_first = agent.context_compressor.protect_first_n
+        protect_last = agent.context_compressor.protect_last_n
+        prefill = []
+        for _i in range(protect_first + protect_last + 4):
+            prefill.append({"role": "user", "content": f"q{_i}"})
+            prefill.append({"role": "assistant", "content": f"a{_i}"})
+
+        agent.context_compressor.threshold_tokens = 10**9
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Done", finish_reason="stop"
+        )
+
+        with (
+            patch.object(
+                agent.context_compressor,
+                "should_compress_preflight",
+                return_value=False,
+            ) as mock_preflight,
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", conversation_history=prefill)
+
+        mock_preflight.assert_called_once()
+        mock_compress.assert_not_called()
+        assert result["final_response"] == "Done"
+        assert result["completed"] is True
+
+    def test_engine_preflight_exception_does_not_break_turn(self, agent):
+        """A buggy engine preflight hook should be ignored for this turn."""
+        self._setup_agent(agent)
+        agent.compression_enabled = True
+
+        protect_first = agent.context_compressor.protect_first_n
+        protect_last = agent.context_compressor.protect_last_n
+        prefill = []
+        for _i in range(protect_first + protect_last + 4):
+            prefill.append({"role": "user", "content": f"q{_i}"})
+            prefill.append({"role": "assistant", "content": f"a{_i}"})
+
+        agent.context_compressor.threshold_tokens = 10**9
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Done", finish_reason="stop"
+        )
+
+        with (
+            patch.object(
+                agent.context_compressor,
+                "should_compress_preflight",
+                side_effect=RuntimeError("buggy engine"),
+            ),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", conversation_history=prefill)
+
+        mock_compress.assert_not_called()
+        assert result["final_response"] == "Done"
+        assert result["completed"] is True
+
     def test_glm_prompt_exceeds_max_length_triggers_compression(self, agent):
         """GLM/Z.AI uses 'Prompt exceeds max length' for context overflow."""
         self._setup_agent(agent)
