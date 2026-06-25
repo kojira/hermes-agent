@@ -10288,23 +10288,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if engine_name != "lcm" and not type(compressor).__module__.startswith("hermes_plugins.hermes_lcm"):
             return
 
-        try:
-            eligible, reason = compressor._leaf_compaction_candidate_status(messages)
-        except Exception:
-            try:
-                eligible = bool(compressor.should_compress_preflight(messages))
-                reason = "engine preflight requested maintenance" if eligible else "engine preflight declined"
-            except Exception as exc:
-                logger.debug("LCM post-delivery maintenance eligibility check failed: %s", exc)
-                return
-        if not eligible:
-            logger.debug("LCM post-delivery maintenance skipped: %s", reason)
-            return
-
         adapter = self.adapters.get(source.platform) if source is not None else None
         register_cb = getattr(adapter, "register_post_delivery_callback", None)
         if not callable(register_cb):
+            logger.info(
+                "LCM post-delivery maintenance not registered: adapter has no post-delivery callback support session=%s",
+                session_key,
+            )
             return
+        logger.info(
+            "LCM post-delivery maintenance registered: session=%s messages=%d prompt_tokens=%s",
+            session_key,
+            len(messages),
+            agent_result.get("last_prompt_tokens"),
+        )
 
         async def _post_delivery_lcm_maintenance() -> None:
             def _run() -> None:
@@ -10320,6 +10317,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     agent.notice_clear_callback = None
                     # Post-turn maintenance must not rotate gateway sessions.
                     agent.compression_in_place = True
+                    try:
+                        eligible, reason = compressor._leaf_compaction_candidate_status(messages)
+                    except Exception:
+                        eligible, reason = True, "eligibility check unavailable; letting LCM compress decide"
+                    if not eligible:
+                        logger.info(
+                            "LCM post-delivery maintenance skipped: session=%s reason=%s messages=%d",
+                            getattr(session_entry, "session_id", None) or getattr(agent, "session_id", ""),
+                            reason,
+                            len(messages),
+                        )
+                        return
                     logger.info(
                         "LCM post-delivery maintenance: compacting old raw backlog for session=%s messages=%d reason=%s",
                         getattr(session_entry, "session_id", None) or getattr(agent, "session_id", ""),
