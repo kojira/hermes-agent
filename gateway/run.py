@@ -10111,6 +10111,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # content the user hasn't seen (streaming only sent earlier
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
+            _post_delivery_agent = None
+            if isinstance(agent_result, dict):
+                _post_delivery_agent = agent_result.pop("_post_delivery_agent", None)
+            self._register_lcm_post_delivery_maintenance(
+                source=source,
+                session_key=session_key,
+                session_entry=session_entry,
+                run_generation=run_generation,
+                agent=_post_delivery_agent,
+                agent_result=agent_result,
+            )
+
             if agent_result.get("already_sent") and not agent_result.get("failed"):
                 if response:
                     _media_adapter = self.adapters.get(source.platform)
@@ -10243,6 +10255,109 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         finally:
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
+
+    def _register_lcm_post_delivery_maintenance(
+        self,
+        *,
+        source,
+        session_key: str,
+        session_entry,
+        run_generation: int | None,
+        agent,
+        agent_result: dict,
+    ) -> None:
+        """Compact one old LCM leaf after the user-visible response is delivered.
+
+        This is deliberately post-delivery and in-place: the foreground turn
+        sends its answer first, then the idle gap before the next user message is
+        used to summarize a bounded chunk of old raw backlog outside LCM's fresh
+        tail.  That avoids the bad UX where the next user message pays the full
+        preflight compaction cost synchronously.
+        """
+        if not session_key or agent is None or not isinstance(agent_result, dict):
+            return
+        if agent_result.get("failed") or agent_result.get("interrupted"):
+            return
+        messages = list(agent_result.get("messages") or [])
+        if not messages:
+            return
+        compressor = getattr(agent, "context_compressor", None)
+        if compressor is None:
+            return
+        engine_name = getattr(compressor, "name", "") or ""
+        if engine_name != "lcm" and not type(compressor).__module__.startswith("hermes_plugins.hermes_lcm"):
+            return
+
+        try:
+            eligible, reason = compressor._leaf_compaction_candidate_status(messages)
+        except Exception:
+            try:
+                eligible = bool(compressor.should_compress_preflight(messages))
+                reason = "engine preflight requested maintenance" if eligible else "engine preflight declined"
+            except Exception as exc:
+                logger.debug("LCM post-delivery maintenance eligibility check failed: %s", exc)
+                return
+        if not eligible:
+            logger.debug("LCM post-delivery maintenance skipped: %s", reason)
+            return
+
+        adapter = self.adapters.get(source.platform) if source is not None else None
+        register_cb = getattr(adapter, "register_post_delivery_callback", None)
+        if not callable(register_cb):
+            return
+
+        async def _post_delivery_lcm_maintenance() -> None:
+            def _run() -> None:
+                old_status_cb = getattr(agent, "status_callback", None)
+                old_notice_cb = getattr(agent, "notice_callback", None)
+                old_notice_clear_cb = getattr(agent, "notice_clear_callback", None)
+                old_in_place = bool(getattr(agent, "compression_in_place", False))
+                try:
+                    # Keep this maintenance invisible to the user: it happens
+                    # after delivery and should not post a new status bubble.
+                    agent.status_callback = None
+                    agent.notice_callback = None
+                    agent.notice_clear_callback = None
+                    # Post-turn maintenance must not rotate gateway sessions.
+                    agent.compression_in_place = True
+                    logger.info(
+                        "LCM post-delivery maintenance: compacting old raw backlog for session=%s messages=%d reason=%s",
+                        getattr(session_entry, "session_id", None) or getattr(agent, "session_id", ""),
+                        len(messages),
+                        reason,
+                    )
+                    before_len = len(messages)
+                    before_sid = getattr(agent, "session_id", "")
+                    compressed, _ = agent._compress_context(
+                        messages,
+                        None,
+                        approx_tokens=0,
+                        task_id=getattr(session_entry, "session_id", None) or before_sid or "post-delivery",
+                    )
+                    logger.info(
+                        "LCM post-delivery maintenance complete: session=%s messages=%d→%d",
+                        getattr(agent, "session_id", "") or before_sid,
+                        before_len,
+                        len(compressed or []),
+                    )
+                    try:
+                        self._refresh_agent_cache_message_count(
+                            session_key,
+                            getattr(session_entry, "session_id", None) or getattr(agent, "session_id", ""),
+                        )
+                    except Exception:
+                        logger.debug("LCM post-delivery cache refresh failed", exc_info=True)
+                except Exception as exc:
+                    logger.debug("LCM post-delivery maintenance failed: %s", exc, exc_info=True)
+                finally:
+                    agent.status_callback = old_status_cb
+                    agent.notice_callback = old_notice_cb
+                    agent.notice_clear_callback = old_notice_clear_cb
+                    agent.compression_in_place = old_in_place
+
+            await asyncio.to_thread(_run)
+
+        register_cb(session_key, _post_delivery_lcm_maintenance, generation=run_generation)
 
     def _format_session_info(self) -> str:
         """Resolve current model config and return a formatted info block.
@@ -16313,6 +16428,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "model": _resolved_model,
                 "context_length": _context_length,
                 "session_id": effective_session_id,
+                # Internal-only: consumed by GatewayRunner before delivery to
+                # register post-delivery maintenance.  This key is removed from
+                # the result dict before any user-facing handling.
+                "_post_delivery_agent": agent,
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),
             }
